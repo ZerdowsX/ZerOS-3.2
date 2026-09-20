@@ -660,3 +660,6 @@ linker.ld, Makefile, grub.cfg
 2. Subdirectories + bigger files in NuggetFS.
 3. TCP retransmission timers.
 4. USB (start with UHCI).
+
+
+OS Created with Claude

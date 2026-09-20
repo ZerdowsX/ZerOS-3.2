@@ -1,3 +1,8 @@
+An OS created with the help of Claude.
+Just so you know, this OS doesn't look that great because
+I didn't really know much about how OSs work back then; nowadays my systems
+look excellent, but I don't plan on publishing them.
+
 # Nugget OS
 
 A hobby x86_64 kernel built from scratch: bootloader, memory management,

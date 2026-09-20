@@ -1,122 +1,160 @@
 #include "types.h"
 #include "vga.h"
-#include "string.h"
+#include "serial.h"
+#include "gdt.h"
+#include "idt.h"
+#include "pmm.h"
+#include "heap.h"
+#include "timer.h"
+#include "fb.h"
+#include "splash.h"
+#include "font.h"
+#include "cursor.h"
+#include "mouse.h"
+#include "keyboard.h"
+#include "ata.h"
+#include "nuggetfs.h"
+#include "installer.h"
+#include "wallpaper.h"
+#include "socks.h"
+#include "wm.h"
+#include "net.h"
+#include "dhcp.h"
+#include "rtl8139.h"
+#include "pcnet.h"
+#include "e1000.h"
 
-static volatile uint16_t *const VGA_MEM = (uint16_t*)0xB8000;
-#define VGA_WIDTH 80
-#define VGA_HEIGHT 25
+/* Defined by linker.ld - marks the first free byte right after the kernel
+   image (code + rodata + data + bss). Only its address matters, so it's
+   declared as an opaque symbol rather than given a real type. */
+extern uint8_t kernel_end;
 
-static size_t vga_row = 0;
-static size_t vga_col = 0;
-static uint8_t vga_color = 0x0F; // white on black
+/* Static bump-allocator heap region. Placed well above the low-memory
+   area used by the .socks loader (SOCKS_API_ADDR/SOCKS_LOAD_ADDR sit
+   around 0x6FF000-0x700000) and above the kernel image itself, which
+   embeds the boot logo/wallpaper/icon bitmaps and can run to a few MiB. */
+#define HEAP_START 0x1000000ULL   /* 16 MiB */
+#define HEAP_SIZE  0x4000000ULL   /* 64 MiB */
 
-static inline uint16_t vga_entry(char c, uint8_t color) {
-    return (uint16_t)c | ((uint16_t)color << 8);
+/* Timer frequency - the network stack's blocking waits (net_resolve_arp_blocking,
+   dhcp_negotiate) assume 100 ticks/sec. */
+#define TIMER_HZ 100
+
+/* Fallback static network config, used only if DHCP doesn't get an answer. */
+#define FALLBACK_IP      MAKE_IP(10, 0, 2, 15)
+#define FALLBACK_NETMASK MAKE_IP(255, 255, 255, 0)
+#define FALLBACK_GATEWAY MAKE_IP(10, 0, 2, 2)
+
+/* Brings up whichever NIC actually exists (RTL8139 first - what QEMU
+   emulates by default - then PCNet for VirtualBox, then e1000), wires
+   its send/get_mac/rx-callback into the NIC-agnostic net.c layer, and
+   returns true if any driver was found. */
+static bool net_bring_up_nic(void) {
+    if (rtl8139_init()) {
+        rtl8139_set_rx_callback(net_rx_handler_entry);
+        net_set_nic(rtl8139_send, rtl8139_get_mac);
+        serial_write("[net] using RTL8139\n");
+        return true;
+    }
+    if (pcnet_init()) {
+        pcnet_set_rx_callback(net_rx_handler_entry);
+        net_set_nic(pcnet_send, pcnet_get_mac);
+        serial_write("[net] using PCNet\n");
+        return true;
+    }
+    if (e1000_init()) {
+        e1000_set_rx_callback(net_rx_handler_entry);
+        net_set_nic(e1000_send, e1000_get_mac);
+        serial_write("[net] using e1000\n");
+        return true;
+    }
+    serial_write("[net] no supported NIC found\n");
+    return false;
 }
 
-void vga_clear(void) {
-    for (size_t y = 0; y < VGA_HEIGHT; y++)
-        for (size_t x = 0; x < VGA_WIDTH; x++)
-            VGA_MEM[y * VGA_WIDTH + x] = vga_entry(' ', vga_color);
-    vga_row = 0;
-    vga_col = 0;
-}
+void kernel_main(uint32_t mb2_info_addr) {
+    /* --- Early debug output, before we can trust anything graphical --- */
+    serial_init();
+    serial_write("\n[boot] Nugget OS starting\n");
 
-void vga_set_color(uint8_t fg, uint8_t bg) {
-    vga_color = fg | (bg << 4);
-}
+    /* --- CPU/memory plumbing --- */
+    gdt_init();
+    idt_init();
+    pmm_init(mb2_info_addr, (uint64_t)&kernel_end);
+    heap_init(HEAP_START, HEAP_SIZE);
+    timer_init(TIMER_HZ);
+    serial_write("[boot] gdt/idt/pmm/heap/timer ready\n");
 
-static void vga_scroll(void) {
-    for (size_t y = 1; y < VGA_HEIGHT; y++)
-        for (size_t x = 0; x < VGA_WIDTH; x++)
-            VGA_MEM[(y-1) * VGA_WIDTH + x] = VGA_MEM[y * VGA_WIDTH + x];
-    for (size_t x = 0; x < VGA_WIDTH; x++)
-        VGA_MEM[(VGA_HEIGHT-1) * VGA_WIDTH + x] = vga_entry(' ', vga_color);
-    vga_row = VGA_HEIGHT - 1;
-}
-
-void vga_putc(char c) {
-    if (c == '\n') {
-        vga_col = 0;
-        vga_row++;
-    } else if (c == '\r') {
-        vga_col = 0;
+    /* --- Graphics --- */
+    bool have_fb = fb_init(mb2_info_addr);
+    if (have_fb) {
+        splash_show();
+        splash_set_progress(10);
     } else {
-        VGA_MEM[vga_row * VGA_WIDTH + vga_col] = vga_entry(c, vga_color);
-        vga_col++;
-        if (vga_col >= VGA_WIDTH) { vga_col = 0; vga_row++; }
+        serial_write("[boot] WARNING: no framebuffer, falling back to text output\n");
+        vga_clear();
+        vga_write("Nugget OS: no framebuffer available.\n");
     }
-    if (vga_row >= VGA_HEIGHT) vga_scroll();
-}
 
-void vga_write(const char *s) {
-    while (*s) vga_putc(*s++);
-}
-
-static void vga_write_hex(uint64_t val) {
-    char buf[17];
-    const char *hex = "0123456789ABCDEF";
-    buf[16] = '\0';
-    for (int i = 15; i >= 0; i--) {
-        buf[i] = hex[val & 0xF];
-        val >>= 4;
+    /* --- Storage / filesystem --- */
+    ata_init();
+    if (have_fb) splash_set_progress(35);
+    if (installer_needed()) {
+        installer_run();
     }
-    vga_write(buf);
-}
+    software_ensure_builtin_programs();
+    wallpaper_restore_saved_choice();
+    socks_api_init();
+    if (have_fb) splash_set_progress(55);
+    serial_write("[boot] storage/filesystem ready\n");
 
-static void vga_write_dec(uint64_t val) {
-    char buf[21];
-    int i = 20;
-    buf[i--] = '\0';
-    if (val == 0) { vga_putc('0'); return; }
-    while (val > 0) {
-        buf[i--] = '0' + (val % 10);
-        val /= 10;
+    /* --- Input --- */
+    keyboard_init();
+    mouse_init();
+    if (have_fb) {
+        mouse_set_bounds((int32_t)fb_width(), (int32_t)fb_height());
+        cursor_init();
     }
-    vga_write(&buf[i+1]);
-}
 
-/* Minimal printf-style formatter: supports %s %d %u %x %c %% */
-void kprintf(const char *fmt, ...) {
-    __builtin_va_list args;
-    __builtin_va_start(args, fmt);
-    for (const char *p = fmt; *p; p++) {
-        if (*p != '%') { vga_putc(*p); continue; }
-        p++;
-        switch (*p) {
-            case 's': {
-                const char *s = __builtin_va_arg(args, const char*);
-                vga_write(s ? s : "(null)");
-                break;
-            }
-            case 'd': {
-                int64_t v = __builtin_va_arg(args, int64_t);
-                if (v < 0) { vga_putc('-'); v = -v; }
-                vga_write_dec((uint64_t)v);
-                break;
-            }
-            case 'u': {
-                uint64_t v = __builtin_va_arg(args, uint64_t);
-                vga_write_dec(v);
-                break;
-            }
-            case 'x': {
-                uint64_t v = __builtin_va_arg(args, uint64_t);
-                vga_write_hex(v);
-                break;
-            }
-            case 'c': {
-                int v = __builtin_va_arg(args, int);
-                vga_putc((char)v);
-                break;
-            }
-            case '%':
-                vga_putc('%');
-                break;
-            default:
-                vga_putc('%');
-                vga_putc(*p);
+    /* --- Networking (best-effort - a missing/unsupported NIC isn't fatal) --- */
+    net_init();
+    if (net_bring_up_nic()) {
+        uint32_t ip, netmask, gateway;
+        if (dhcp_negotiate(&ip, &netmask, &gateway)) {
+            net_set_ip_config(ip, netmask, gateway);
+            serial_write("[net] DHCP lease acquired\n");
+        } else {
+            net_set_ip_config(FALLBACK_IP, FALLBACK_NETMASK, FALLBACK_GATEWAY);
+            serial_write("[net] DHCP failed, using fallback static IP\n");
         }
     }
-    __builtin_va_end(args);
+    if (have_fb) splash_set_progress(90);
+
+    /* --- Desktop --- */
+    if (have_fb) {
+        splash_set_progress(100);
+        splash_clear();
+        wm_init();
+    }
+    serial_write("[boot] desktop ready\n");
+
+    __asm__ volatile ("sti");
+
+    if (!have_fb) {
+        /* No framebuffer, nothing sensible to render - just idle. */
+        for (;;) __asm__ volatile ("hlt");
+    }
+
+    /* --- Main loop --- */
+    for (;;) {
+        mouse_state_t ms = mouse_get_state();
+        wm_update(ms.x, ms.y, ms.left, ms.right);
+
+        while (keyboard_has_data()) {
+            char c = keyboard_getchar();
+            if (c) wm_handle_key(c);
+        }
+
+        __asm__ volatile ("hlt");
+    }
 }

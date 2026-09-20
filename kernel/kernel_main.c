@@ -96,6 +96,18 @@ void kernel_main(uint32_t mb2_info_addr) {
         vga_write("Nugget OS: no framebuffer available.\n");
     }
 
+    /* --- Input --- */
+    /* Must come before the installer wizard below: installer_run() polls
+       mouse_get_state()/cursor_reset() itself to drive its own click-based
+       UI, so the PS/2 mouse and cursor need to be live before it runs, not
+       after. */
+    keyboard_init();
+    mouse_init();
+    if (have_fb) {
+        mouse_set_bounds((int32_t)fb_width(), (int32_t)fb_height());
+        cursor_init();
+    }
+
     /* --- Storage / filesystem --- */
     ata_init();
     if (have_fb) splash_set_progress(35);
@@ -107,14 +119,6 @@ void kernel_main(uint32_t mb2_info_addr) {
     socks_api_init();
     if (have_fb) splash_set_progress(55);
     serial_write("[boot] storage/filesystem ready\n");
-
-    /* --- Input --- */
-    keyboard_init();
-    mouse_init();
-    if (have_fb) {
-        mouse_set_bounds((int32_t)fb_width(), (int32_t)fb_height());
-        cursor_init();
-    }
 
     /* --- Networking (best-effort - a missing/unsupported NIC isn't fatal) --- */
     net_init();
